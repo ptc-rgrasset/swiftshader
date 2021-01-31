@@ -32,6 +32,7 @@
 
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/raw_os_ostream.h"
 
 #include "marl/event.h"
@@ -214,6 +215,9 @@ class CoroutineGenerator;
 }  // namespace rr
 
 namespace {
+
+// Used to automatically invoke llvm_shutdown() when driver is unloaded
+llvm::llvm_shutdown_obj llvmShutdownObj;
 
 // Default configuration settings. Must be accessed under mutex lock.
 std::mutex defaultConfigLock;
@@ -829,6 +833,25 @@ public:
 
 	const void *addConstantData(const void *data, size_t size, size_t alignment = 1)
 	{
+		// Check if we already have a suitable constant.
+		for(const auto &c : constantsPool)
+		{
+			void *ptr = c.data.get();
+			size_t space = c.space;
+
+			void *alignedPtr = std::align(alignment, size, ptr, space);
+
+			if(space < size)
+			{
+				continue;
+			}
+
+			if(memcmp(data, alignedPtr, size) == 0)
+			{
+				return alignedPtr;
+			}
+		}
+
 		// TODO(b/148086935): Replace with a buffer allocator.
 		size_t space = size + alignment;
 		auto buf = std::unique_ptr<uint8_t[]>(new uint8_t[space]);
@@ -836,15 +859,27 @@ public:
 		void *alignedPtr = std::align(alignment, size, ptr, space);
 		ASSERT(alignedPtr);
 		memcpy(alignedPtr, data, size);
-		constantData.emplace_back(std::move(buf));
+		constantsPool.emplace_back(std::move(buf), space);
+
 		return alignedPtr;
 	}
 
 private:
+	struct Constant
+	{
+		Constant(std::unique_ptr<uint8_t[]> data, size_t space)
+		    : data(std::move(data))
+		    , space(space)
+		{}
+
+		std::unique_ptr<uint8_t[]> data;
+		size_t space;
+	};
+
 	std::array<const void *, Nucleus::CoroutineEntryCount> funcs = {};
 	std::vector<uint8_t, ExecutableAllocator<uint8_t>> buffer;
 	std::size_t position;
-	std::vector<std::unique_ptr<uint8_t[]>> constantData;
+	std::vector<Constant> constantsPool;
 };
 
 #ifdef ENABLE_RR_PRINT
@@ -3589,6 +3624,33 @@ RValue<Int4> RoundInt(RValue<Float4> cast)
 	}
 }
 
+RValue<Int4> RoundIntClamped(RValue<Float4> cast)
+{
+	RR_DEBUG_INFO_UPDATE_LOC();
+
+	// cvtps2dq produces 0x80000000, a negative value, for input larger than
+	// 2147483520.0, so clamp to 2147483520. Values less than -2147483520.0
+	// saturate to 0x80000000.
+	RValue<Float4> clamped = Min(cast, Float4(0x7FFFFF80));
+
+	if(emulateIntrinsics || CPUID::ARM)
+	{
+		// Push the fractional part off the mantissa. Accurate up to +/-2^22.
+		return Int4((clamped + Float4(0x00C00000)) - Float4(0x00C00000));
+	}
+	else
+	{
+		Ice::Variable *result = ::function->makeVariable(Ice::IceType_v4i32);
+		const Ice::Intrinsics::IntrinsicInfo intrinsic = { Ice::Intrinsics::Nearbyint, Ice::Intrinsics::SideEffects_F, Ice::Intrinsics::ReturnsTwice_F, Ice::Intrinsics::MemoryWrite_F };
+		auto target = ::context->getConstantUndef(Ice::IceType_i32);
+		auto nearbyint = Ice::InstIntrinsicCall::create(::function, 1, result, target, intrinsic);
+		nearbyint->addArg(clamped.value());
+		::basicBlock->appendInst(nearbyint);
+
+		return RValue<Int4>(V(result));
+	}
+}
+
 RValue<Short8> PackSigned(RValue<Int4> x, RValue<Int4> y)
 {
 	RR_DEBUG_INFO_UPDATE_LOC();
@@ -3930,6 +3992,45 @@ RValue<Float4> RcpSqrt_pp(RValue<Float4> x)
 {
 	RR_DEBUG_INFO_UPDATE_LOC();
 	return Rcp_pp(Sqrt(x));
+}
+
+bool HasRcpApprox()
+{
+	// TODO(b/175612820): Update once we implement x86 SSE rcp_ss and rsqrt_ss intrinsics in Subzero
+	return false;
+}
+
+RValue<Float4> RcpApprox(RValue<Float4> x, bool exactAtPow2)
+{
+	// TODO(b/175612820): Update once we implement x86 SSE rcp_ss and rsqrt_ss intrinsics in Subzero
+	UNREACHABLE("RValue<Float4> RcpApprox()");
+	return { 0.0f };
+}
+
+RValue<Float> RcpApprox(RValue<Float> x, bool exactAtPow2)
+{
+	// TODO(b/175612820): Update once we implement x86 SSE rcp_ss and rsqrt_ss intrinsics in Subzero
+	UNREACHABLE("RValue<Float> RcpApprox()");
+	return { 0.0f };
+}
+
+bool HasRcpSqrtApprox()
+{
+	return false;
+}
+
+RValue<Float4> RcpSqrtApprox(RValue<Float4> x)
+{
+	// TODO(b/175612820): Update once we implement x86 SSE rcp_ss and rsqrt_ss intrinsics in Subzero
+	UNREACHABLE("RValue<Float4> RcpSqrtApprox()");
+	return { 0.0f };
+}
+
+RValue<Float> RcpSqrtApprox(RValue<Float> x)
+{
+	// TODO(b/175612820): Update once we implement x86 SSE rcp_ss and rsqrt_ss intrinsics in Subzero
+	UNREACHABLE("RValue<Float> RcpSqrtApprox()");
+	return { 0.0f };
 }
 
 RValue<Float4> Sqrt(RValue<Float4> x)

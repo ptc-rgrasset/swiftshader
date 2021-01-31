@@ -14,9 +14,14 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-set(CMAKE_CXX_STANDARD 14)
-
 project(SwiftShader C CXX ASM)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CXX_STANDARD_REQUIRED ON)
+# MSVC doesn't define __cplusplus by default
+if(MSVC)
+    string(APPEND CMAKE_CXX_FLAGS " /Zc:__cplusplus")
+endif()
 
 ###########################################################
 # Detect system
@@ -93,6 +98,10 @@ if(SWIFTSHADER_BUILD_WSI_DIRECTFB)
     find_library(DIRECTFB directfb)
     find_path(DIRECTFB_INCLUDE_DIR directfb/directfb.h)
 endif(SWIFTSHADER_BUILD_WSI_DIRECTFB)
+if(SWIFTSHADER_BUILD_WSI_D2D)
+    find_library(D2D drm)
+    find_path(D2D_INCLUDE_DIR libdrm/drm.h)
+endif(SWIFTSHADER_BUILD_WSI_D2D)
 
 ###########################################################
 # Options
@@ -121,6 +130,7 @@ option_if_not_defined(SWIFTSHADER_BUILD_GLES_CM "Build the OpenGL ES 1.1 library
 option_if_not_defined(SWIFTSHADER_BUILD_VULKAN "Build the Vulkan library" TRUE)
 option_if_not_defined(SWIFTSHADER_BUILD_WSI_WAYLAND "Build the Wayland WSI support" FALSE)
 option_if_not_defined(SWIFTSHADER_BUILD_WSI_DIRECTFB "Build the DirectFB WSI support" FALSE)
+option_if_not_defined(SWIFTSHADER_BUILD_WSI_D2D "Build the Direct-to-Display WSI support" FALSE)
 option_if_not_defined(SWIFTSHADER_BUILD_PVR "Build the PowerVR examples" TRUE)
 option_if_not_defined(SWIFTSHADER_GET_PVR "Check out the PowerVR submodule" FALSE)
 option_if_not_defined(SWIFTSHADER_BUILD_ANGLE "Build angle" FALSE)
@@ -139,6 +149,7 @@ option_if_not_defined(SWIFTSHADER_WARNINGS_AS_ERRORS "Treat all warnings as erro
 option_if_not_defined(SWIFTSHADER_DCHECK_ALWAYS_ON "Check validation macros even in release builds" FALSE)
 option_if_not_defined(REACTOR_EMIT_DEBUG_INFO "Emit debug info for JIT functions" FALSE)
 option_if_not_defined(REACTOR_EMIT_PRINT_LOCATION "Emit printing of location info for JIT functions" FALSE)
+option_if_not_defined(REACTOR_EMIT_ASM_FILE "Emit asm files for JIT functions" FALSE)
 option_if_not_defined(REACTOR_ENABLE_PRINT "Enable RR_PRINT macros" FALSE)
 option_if_not_defined(REACTOR_VERIFY_LLVM_IR "Check reactor-generated LLVM IR is valid even in release builds" FALSE)
 option_if_not_defined(SWIFTSHADER_LESS_DEBUG_INFO "Generate less debug info to reduce file size" FALSE)
@@ -163,7 +174,7 @@ set_property(CACHE SWIFTSHADER_LLVM_VERSION PROPERTY STRINGS "10.0")
 
 # If defined, overrides the default optimization level of the current reactor backend.
 # Set to one of the rr::Optimization::Level enum values.
-set(REACTOR_DEFAULT_OPT_LEVEL "Default" CACHE STRING "Reactor default optimization level")
+set(REACTOR_DEFAULT_OPT_LEVEL "" CACHE STRING "Reactor default optimization level")
 set_property(CACHE REACTOR_DEFAULT_OPT_LEVEL PROPERTY STRINGS "None" "Less" "Default" "Aggressive")
 
 # Enable instrumentation of Reactor routines for MemorySanitizer builds (LLVM backend).
@@ -514,6 +525,11 @@ else()
     set_cpp_flag("-fomit-frame-pointer" RELEASE)
 
     if(SWIFTSHADER_MSAN)
+        if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            message(FATAL_ERROR " \n"
+                    " MemorySanitizer usage requires compiling with Clang.")
+        endif()
+
         if(NOT DEFINED ENV{SWIFTSHADER_MSAN_INSTRUMENTED_LIBCXX_PATH})
             message(FATAL_ERROR " \n"
                     " MemorySanitizer usage requires an instrumented build of libc++.\n"
@@ -564,6 +580,10 @@ if(REACTOR_EMIT_PRINT_LOCATION)
     set(REACTOR_EMIT_DEBUG_INFO TRUE)
     set(REACTOR_ENABLE_PRINT TRUE)
     list(APPEND SWIFTSHADER_COMPILE_OPTIONS "-DENABLE_RR_EMIT_PRINT_LOCATION")
+endif()
+
+if(REACTOR_EMIT_ASM_FILE)
+    list(APPEND SWIFTSHADER_COMPILE_OPTIONS "-DENABLE_RR_EMIT_ASM_FILE")
 endif()
 
 if(REACTOR_EMIT_DEBUG_INFO)
@@ -690,6 +710,10 @@ elseif(LINUX)
         list(APPEND OS_LIBS "${DIRECTFB}")
         include_directories(${DIRECTFB_INCLUDE_DIR}/directfb)
     endif(SWIFTSHADER_BUILD_WSI_DIRECTFB)
+    if(SWIFTSHADER_BUILD_WSI_D2D)
+        list(APPEND OS_LIBS "${D2D}")
+        include_directories(${D2D_INCLUDE_DIR}/libdrm)
+    endif(SWIFTSHADER_BUILD_WSI_D2D)
 elseif(FUCHSIA)
     set(OS_LIBS zircon)
 elseif(APPLE)
@@ -780,6 +804,11 @@ if(SWIFTSHADER_BUILD_VULKAN)
                 target_compile_definitions(vk_base INTERFACE "VK_USE_PLATFORM_DIRECTFB_EXT")
             endif()
         endif(SWIFTSHADER_BUILD_WSI_DIRECTFB)
+        if(SWIFTSHADER_BUILD_WSI_D2D)
+            if(D2D)
+                target_compile_definitions(vk_base INTERFACE "VK_USE_PLATFORM_DISPLAY_KHR")
+            endif()
+        endif(SWIFTSHADER_BUILD_WSI_D2D)
     elseif(APPLE)
         target_compile_definitions(vk_base INTERFACE "VK_USE_PLATFORM_MACOS_MVK")
     elseif(FUCHSIA)
@@ -955,15 +984,16 @@ if(SWIFTSHADER_BUILD_TESTS)
 endif()
 
 if(SWIFTSHADER_BUILD_BENCHMARKS)
+    if (NOT TARGET glslang)
+        add_subdirectory(${THIRD_PARTY_DIR}/glslang)
+    endif()
+    add_subdirectory(${TESTS_DIR}/VulkanWrapper) # Add VulkanWrapper target
+
     if (NOT TARGET benchmark::benchmark)
         set(BENCHMARK_ENABLE_TESTING FALSE CACHE BOOL FALSE FORCE)
         add_subdirectory(${THIRD_PARTY_DIR}/benchmark)
         set_target_properties(benchmark PROPERTIES FOLDER "third_party")
         set_target_properties(benchmark_main PROPERTIES FOLDER "third_party")
-    endif()
-
-    if (NOT TARGET glslang)
-        add_subdirectory(${THIRD_PARTY_DIR}/glslang)
     endif()
 
     add_subdirectory(${TESTS_DIR}/ReactorBenchmarks) # Add ReactorBenchmarks target

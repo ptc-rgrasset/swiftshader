@@ -16,6 +16,7 @@
 
 #include "Debug.hpp"
 #include "ExecutableMemory.hpp"
+#include "LLVMAsm.hpp"
 #include "Routine.hpp"
 
 // TODO(b/143539525): Eliminate when warning has been fixed.
@@ -452,6 +453,7 @@ class ExternalSymbolGenerator : public llvm::orc::JITDylib::DefinitionGenerator
 			functions.try_emplace("exp2f", reinterpret_cast<void *>(exp2f));
 			functions.try_emplace("log2f", reinterpret_cast<void *>(log2f));
 
+			functions.try_emplace("fmod", reinterpret_cast<void *>(static_cast<double (*)(double, double)>(fmod)));
 			functions.try_emplace("sin", reinterpret_cast<void *>(static_cast<double (*)(double)>(sin)));
 			functions.try_emplace("cos", reinterpret_cast<void *>(static_cast<double (*)(double)>(cos)));
 			functions.try_emplace("asin", reinterpret_cast<void *>(static_cast<double (*)(double)>(asin)));
@@ -620,31 +622,21 @@ auto &Unwrap(T &&v)
 // settings and no Reactor routine directly links against another.
 class JITRoutine : public rr::Routine
 {
-	llvm::orc::ExecutionSession session;
-	llvm::orc::RTDyldObjectLinkingLayer objectLayer;
-	llvm::orc::IRCompileLayer compileLayer;
-	llvm::orc::MangleAndInterner mangle;
-	llvm::orc::ThreadSafeContext ctx;
-	llvm::orc::JITDylib &dylib;
-	std::vector<const void *> addresses;
-
 public:
 	JITRoutine(
 	    std::unique_ptr<llvm::Module> module,
+	    std::unique_ptr<llvm::LLVMContext> context,
+	    const char *name,
 	    llvm::Function **funcs,
 	    size_t count,
 	    const rr::Config &config)
-	    : objectLayer(session, []() {
+	    : name(name)
+	    , objectLayer(session, []() {
 		    static MemoryMapper memoryMapper;
 		    return std::make_unique<llvm::SectionMemoryManager>(&memoryMapper);
 	    })
-	    , compileLayer(session, objectLayer, std::make_unique<llvm::orc::ConcurrentIRCompiler>(JITGlobals::get()->getTargetMachineBuilder(config.getOptimization().getLevel())))
-	    , mangle(session, JITGlobals::get()->getDataLayout())
-	    , ctx(std::make_unique<llvm::LLVMContext>())
-	    , dylib(Unwrap(session.createJITDylib("<routine>")))
 	    , addresses(count)
 	{
-
 #ifdef ENABLE_RR_DEBUG_INFO
 		// TODO(b/165000222): Update this on next LLVM roll.
 		// https://github.com/llvm/llvm-project/commit/98f2bb4461072347dcca7d2b1b9571b3a6525801
@@ -668,36 +660,48 @@ public:
 			objectLayer.setAutoClaimResponsibilityForObjectSymbols(true);
 		}
 
-		dylib.addGenerator(std::make_unique<ExternalSymbolGenerator>());
+		llvm::SmallVector<llvm::orc::SymbolStringPtr, 8> functionNames(count);
+		llvm::orc::MangleAndInterner mangle(session, JITGlobals::get()->getDataLayout());
 
-		llvm::SmallVector<llvm::orc::SymbolStringPtr, 8> names(count);
 		for(size_t i = 0; i < count; i++)
 		{
 			auto func = funcs[i];
-			func->setLinkage(llvm::GlobalValue::ExternalLinkage);
-			func->setDoesNotThrow();
+
 			if(!func->hasName())
 			{
 				func->setName("f" + llvm::Twine(i).str());
 			}
-			names[i] = mangle(func->getName());
+
+			functionNames[i] = mangle(func->getName());
 		}
 
-		// Once the module is passed to the compileLayer, the
-		// llvm::Functions are freed. Make sure funcs are not referenced
-		// after this point.
+#ifdef ENABLE_RR_EMIT_ASM_FILE
+		const auto asmFilename = rr::AsmFile::generateFilename(name);
+		rr::AsmFile::emitAsmFile(asmFilename, JITGlobals::get()->getTargetMachineBuilder(config.getOptimization().getLevel()), *module);
+#endif
+
+		// Once the module is passed to the compileLayer, the llvm::Functions are freed.
+		// Make sure funcs are not referenced after this point.
 		funcs = nullptr;
 
-		llvm::cantFail(compileLayer.add(dylib, llvm::orc::ThreadSafeModule(std::move(module), ctx)));
+		llvm::orc::IRCompileLayer compileLayer(session, objectLayer, std::make_unique<llvm::orc::ConcurrentIRCompiler>(JITGlobals::get()->getTargetMachineBuilder(config.getOptimization().getLevel())));
+		llvm::orc::JITDylib &dylib(Unwrap(session.createJITDylib("<routine>")));
+		dylib.addGenerator(std::make_unique<ExternalSymbolGenerator>());
+
+		llvm::cantFail(compileLayer.add(dylib, llvm::orc::ThreadSafeModule(std::move(module), std::move(context))));
 
 		// Resolve the function addresses.
 		for(size_t i = 0; i < count; i++)
 		{
-			auto symbol = session.lookup({ &dylib }, names[i]);
+			auto symbol = session.lookup({ &dylib }, functionNames[i]);
 			ASSERT_MSG(symbol, "Failed to lookup address of routine function %d: %s",
 			           (int)i, llvm::toString(symbol.takeError()).c_str());
 			addresses[i] = reinterpret_cast<void *>(static_cast<intptr_t>(symbol->getAddress()));
 		}
+
+#ifdef ENABLE_RR_EMIT_ASM_FILE
+		rr::AsmFile::fixupAsmFile(asmFilename, addresses);
+#endif
 	}
 
 	~JITRoutine()
@@ -714,6 +718,12 @@ public:
 	{
 		return addresses[index];
 	}
+
+private:
+	std::string name;
+	llvm::orc::ExecutionSession session;
+	llvm::orc::RTDyldObjectLinkingLayer objectLayer;
+	std::vector<const void *> addresses;
 };
 
 }  // anonymous namespace
@@ -722,8 +732,9 @@ namespace rr {
 
 JITBuilder::JITBuilder(const rr::Config &config)
     : config(config)
-    , module(new llvm::Module("", context))
-    , builder(new llvm::IRBuilder<>(context))
+    , context(new llvm::LLVMContext())
+    , module(new llvm::Module("", *context))
+    , builder(new llvm::IRBuilder<>(*context))
 {
 	module->setTargetTriple(LLVM_DEFAULT_TARGET_TRIPLE);
 	module->setDataLayout(JITGlobals::get()->getDataLayout());
@@ -770,10 +781,10 @@ void JITBuilder::optimize(const rr::Config &cfg)
 	passManager.run(*module);
 }
 
-std::shared_ptr<rr::Routine> JITBuilder::acquireRoutine(llvm::Function **funcs, size_t count, const rr::Config &cfg)
+std::shared_ptr<rr::Routine> JITBuilder::acquireRoutine(const char *name, llvm::Function **funcs, size_t count, const rr::Config &cfg)
 {
 	ASSERT(module);
-	return std::make_shared<JITRoutine>(std::move(module), funcs, count, cfg);
+	return std::make_shared<JITRoutine>(std::move(module), std::move(context), name, funcs, count, cfg);
 }
 
 }  // namespace rr
